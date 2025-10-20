@@ -1,7 +1,7 @@
 package main
 
 import (
-	"encoding/json"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"net/http"
@@ -11,9 +11,11 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/browserutils/kooky"
 	_ "github.com/browserutils/kooky/browser/all" // register finders for major browsers
+	"encoding/json"
 )
 
 type Row struct {
@@ -25,6 +27,9 @@ type Row struct {
 	Path        string `json:"path"`
 	Name        string `json:"name"`
 	Value       string `json:"value"`
+	ValueHex    string `json:"value_hex"` // new: hex dump of []byte(value)
+	ValidUTF8   bool   `json:"value_valid_utf8"` // new: utf8.ValidString(value)
+	HasNonASCII bool   `json:"has_non_ascii"` // new: any rune >127
 	Secure      bool   `json:"secure"`
 	HttpOnly    bool   `json:"http_only"`
 	SameSite    string `json:"same_site"`
@@ -35,6 +40,7 @@ func main() {
 	matchFlag := flag.String("match", "local,127", "comma-separated substrings to match in cookie domain (case-insensitive)")
 	fullFlag := flag.Bool("full", false, "print full cookie values (default truncates to 80 chars)")
 	jsonFlag := flag.Bool("json", false, "output JSON instead of pretty text")
+	hexFlag := flag.Bool("hex", false, "always print hex dump of value bytes (default: only if invalid UTF-8 or non-ASCII)")
 	flag.Parse()
 
 	matches := splitList(*matchFlag)
@@ -56,15 +62,22 @@ func main() {
 
 	var rows []Row
 	now := time.Now()
-
 	for _, s := range stores {
 		kcs, _ := s.ReadCookies(kooky.Valid)
-
 		for _, kc := range kcs {
 			if !domainHasAny(kc.Domain, matches) {
 				continue
 			}
-
+			val := kc.Value
+			b := []byte(val)
+			validUTF8 := utf8.Valid(b)
+			hasNonASCII := false
+			for _, r := range val {
+				if r > 127 {
+					hasNonASCII = true
+					break
+				}
+			}
 			r := Row{
 				Browser:     s.Browser(),
 				ProfilePath: s.Profile(),
@@ -73,17 +86,18 @@ func main() {
 				HostOnly:    hostOnlyHeuristic(kc.Domain),
 				Path:        kc.Path,
 				Name:        kc.Name,
-				Value:       maybeTruncate(kc.Value, *fullFlag),
+				Value:       maybeTruncate(val, *fullFlag),
+				ValueHex:    hex.EncodeToString(b),
+				ValidUTF8:   validUTF8,
+				HasNonASCII: hasNonASCII,
 				Secure:      kc.Secure,
 				HttpOnly:    kc.HttpOnly,
 				SameSite:    sameSiteToString(kc.SameSite),
 				Expires:     expiresToString(kc.Expires),
 			}
-
 			if !kc.Expires.IsZero() && now.After(kc.Expires) {
 				r.Expires += " (expired)"
 			}
-
 			rows = append(rows, r)
 		}
 	}
@@ -107,7 +121,7 @@ func main() {
 
 	if *jsonFlag {
 		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
+		enc.SetIndent("", " ")
 		_ = enc.Encode(map[string]any{
 			"env": map[string]any{
 				"go":       runtime.Version(),
@@ -131,15 +145,21 @@ func main() {
 		if storeKey != lastStore {
 			fmt.Printf("=== %s\n", storeKey)
 			if r.ProfilePath != "" {
-				fmt.Printf("    profile: %s\n", prettifyPath(r.ProfilePath))
+				fmt.Printf(" profile: %s\n", prettifyPath(r.ProfilePath))
 			}
 			lastStore = storeKey
 		}
-		fmt.Printf("- domain: %s  path: %s  name: %s\n", r.Domain, r.Path, r.Name)
+		fmt.Printf("- domain: %s path: %s name: %s\n", r.Domain, r.Path, r.Name)
 		fmt.Printf("  value : %s\n", r.Value)
+		showHex := *hexFlag || !r.ValidUTF8 || r.HasNonASCII
+		if showHex {
+			fmt.Printf("  value-hex: %s\n", r.ValueHex)
+			fmt.Printf("  value-info: valid_utf8=%v has_non_ascii=%v byte_len=%d\n", r.ValidUTF8, r.HasNonASCII, len([]byte(r.Value)))
+		}
 		fmt.Printf("  flags : secure=%v httpOnly=%v sameSite=%s hostOnly=%v\n", r.Secure, r.HttpOnly, r.SameSite, r.HostOnly)
 		fmt.Printf("  times : expires=%s\n", r.Expires)
 	}
+
 	if len(rows) == 0 {
 		fmt.Println("No matching cookies. Try logging in to your Gateway on BOTH https://localhost:PORT and https://127.0.0.1:PORT and re-run.")
 	}
