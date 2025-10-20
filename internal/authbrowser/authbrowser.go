@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+    "log/slog"
 	"os"
 	"net/http"
 	"net/http/cookiejar"
@@ -30,6 +31,8 @@ type Options struct {
 	Headless     bool          // false => show window for 2FA
 	Wait         time.Duration // overall timeout (e.g., 2-5 minutes)
 	UserDataDir  string        // optional Chrome profile dir; empty => temp
+    Logger       *slog.Logger  // optional: route chromedp logs to slog
+    Quiet        bool          // if true, suppress chromedp debug/log output
 }
 
 func AcquireSessionCookie(ctx context.Context, httpJar *cookiejar.Jar, opts Options) error {
@@ -62,7 +65,22 @@ func AcquireSessionCookie(ctx context.Context, httpJar *cookiejar.Jar, opts Opti
 
 	actx, acancel := chromedp.NewExecAllocator(ctx, allocOpts...)
 	defer acancel()
-	cctx, cancel := chromedp.NewContext(actx) // creates a new browser tab
+    // Optionally wire chromedp logging to slog or silence it
+    var ctxOpts []chromedp.ContextOption
+    if opts.Quiet {
+        ctxOpts = append(ctxOpts,
+            chromedp.WithLogf(func(string, ...any) {}),
+            chromedp.WithDebugf(func(string, ...any) {}),
+            chromedp.WithErrorf(func(string, ...any) {}),
+        )
+    } else if opts.Logger != nil {
+        ctxOpts = append(ctxOpts,
+            chromedp.WithLogf(func(f string, a ...any) { opts.Logger.Info(fmt.Sprintf(f, a...)) }),
+            chromedp.WithDebugf(func(f string, a ...any) { opts.Logger.Debug(fmt.Sprintf(f, a...)) }),
+            chromedp.WithErrorf(func(f string, a ...any) { opts.Logger.Warn(fmt.Sprintf(f, a...)) }),
+        )
+    }
+    cctx, cancel := chromedp.NewContext(actx, ctxOpts...) // creates a new browser tab
 	defer cancel()
 
 	// Give the whole flow a max time
@@ -137,8 +155,8 @@ func AcquireSessionCookie(ctx context.Context, httpJar *cookiejar.Jar, opts Opti
     }
 
     // 3) Export cookies from Chrome and inject into our Go http jar for the base host.
-    // Use GetCookies (works across cdproto versions); scope by URL.
-    cks, err := network.GetCookies().WithUrls([]string{opts.BaseURL}).Do(cctx)
+    // Use GetCookies (works across newer cdproto versions); scope by URL.
+    cks, err := network.GetCookies().WithURLs([]string{opts.BaseURL}).Do(cctx)
     if err != nil {
         return fmt.Errorf("get cookies: %w", err)
     }

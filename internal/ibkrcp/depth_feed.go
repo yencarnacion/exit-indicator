@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+    "net"
 	"net/url"
 	"strings"
 	"sync"
@@ -223,6 +224,10 @@ func (f *IBKRCPGatewayDepthFeed) openWS() (*websocket.Conn, error) {
 	u.Path = "/v1/api/ws"
 	d := websocket.Dialer{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // #nosec G402 local gateway
+        NetDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+            var nd net.Dialer
+            return nd.DialContext(ctx, "tcp4", addr)
+        },
 	}
 	ws, _, err := d.DialContext(f.ctx, u.String(), nil)
 	return ws, err

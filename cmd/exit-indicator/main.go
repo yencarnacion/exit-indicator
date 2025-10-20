@@ -51,6 +51,20 @@ func main() {
 	client := ibkrcp.NewClient(cfg.IBKRGatewayURL, cfg.SessionStorePath, logger)
 	feed := ibkrcp.NewGatewayDepthFeed(client, logger)
 
+	// Optional: one-shot login mode to acquire/refresh session and exit.
+	for _, a := range os.Args[1:] {
+		if a == "--login" {
+			ctx, cancelLogin := context.WithTimeout(context.Background(), 15*time.Minute)
+			defer cancelLogin()
+			if err := client.Connect(ctx); err != nil {
+				logger.Error("login failed", slog.String("err", err.Error()))
+				os.Exit(1)
+			}
+			logger.Info("login successful (authenticated:true); session saved")
+			return
+		}
+	}
+
 	// Aggregator (pure)
 	aggregator := depth.NewAggregator(st, cfg.LevelsToScan)
 
