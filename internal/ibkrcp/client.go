@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+    "strconv"
     "net"
 	"net/http"
 	"net/http/cookiejar"
@@ -39,7 +40,14 @@ func NewClient(baseURL, sessionStorePath string, logger *slog.Logger) *Client {
             return d.DialContext(ctx, "tcp4", addr) // force IPv4
         },
 	}
-	httpc := &http.Client{Jar: jar, Transport: tr, Timeout: 15 * time.Second}
+    // Allow overriding HTTP timeout for slow-starting gateways
+    to := 15 * time.Second
+    if s := os.Getenv("EXIT_INDICATOR_HTTP_TIMEOUT_SECONDS"); s != "" {
+        if n, err := strconv.Atoi(s); err == nil && n > 0 && n <= 600 {
+            to = time.Duration(n) * time.Second
+        }
+    }
+    httpc := &http.Client{Jar: jar, Transport: tr, Timeout: to}
 	return &Client{
 		baseURL:     baseURL,
 		jar:         jar,
@@ -176,7 +184,25 @@ func (c *Client) Connect(ctx context.Context) error {
     req, _ := http.NewRequestWithContext(ctx, http.MethodGet, c.url("/v1/api/iserver/auth/status"), nil)
     resp, err := c.httpc.Do(req)
     if err != nil {
-        return fmt.Errorf("gateway unreachable: %w", err)
+        // Try a one-shot browser-assisted login to nudge the gateway into a session
+        rl := 2
+        if os.Getenv("EXIT_INDICATOR_IBKR_RL") == "1" { rl = 1 }
+        abOpts := authbrowser.Options{
+            BaseURL:  c.baseURL,
+            RL:       rl,
+            Headless: false,
+            Wait:     0,     // uses EXIT_INDICATOR_LOGIN_WAIT_SECONDS
+            Quiet:    true,
+        }
+        if err2 := authbrowser.AcquireSessionCookie(ctx, c.jar, abOpts); err2 != nil {
+            return fmt.Errorf("gateway unreachable: %w", err)
+        }
+        // Re-check status after browser flow
+        req, _ = http.NewRequestWithContext(ctx, http.MethodGet, c.url("/v1/api/iserver/auth/status"), nil)
+        resp, err = c.httpc.Do(req)
+        if err != nil {
+            return fmt.Errorf("gateway unreachable after browser flow: %w", err)
+        }
     }
     if resp.StatusCode >= 500 {
         resp.Body.Close()
