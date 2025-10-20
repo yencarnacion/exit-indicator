@@ -2,6 +2,7 @@ package cookies
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -15,9 +16,19 @@ import (
 	_ "github.com/browserutils/kooky/browser/all" // register all browser finders
 )
 
-// json shape expected by internal/ibkrcp/client.go
+type savedCookie struct {
+	Name        string          `json:"name"`
+	ValueBase64 string          `json:"value_base64"`
+	Path        string          `json:"path"`
+	Domain      string          `json:"domain"`
+	Expires     time.Time       `json:"expires"`
+	Secure      bool            `json:"secure"`
+	HttpOnly    bool            `json:"http_only"`
+	SameSite    http.SameSite   `json:"same_site"`
+}
+
 type cookieDump struct {
-	Cookies []*http.Cookie `json:"cookies"`
+	Cookies []savedCookie `json:"cookies"`
 }
 
 // ForURL reads cookies for the given base URL's host from all supported browsers.
@@ -32,7 +43,6 @@ func ForURL(ctx context.Context, rawURL string) ([]*http.Cookie, error) {
 	if host == "" {
 		return nil, fmt.Errorf("invalid url host in %q", rawURL)
 	}
-
 	stores := kooky.FindAllCookieStores()
 	if len(stores) == 0 {
 		return nil, fmt.Errorf("no browser cookie stores found")
@@ -42,11 +52,9 @@ func ForURL(ctx context.Context, rawURL string) ([]*http.Cookie, error) {
 			_ = s.Close()
 		}
 	}()
-
 	now := time.Now()
 	var out []*http.Cookie
 	seen := make(map[string]bool)
-
 	for _, s := range stores {
 		kcs, _ := s.ReadCookies(
 			kooky.DomainHasSuffix(host),
@@ -63,12 +71,11 @@ func ForURL(ctx context.Context, rawURL string) ([]*http.Cookie, error) {
 				Value:    kc.Value,
 				Domain:   kc.Domain,
 				Path:     kc.Path,
-				Expires:  kc.Expires,   // zero -> session cookie
+				Expires:  kc.Expires, // zero -> session cookie
 				Secure:   kc.Secure,
-				HttpOnly: kc.HttpOnly,  // note the capitalization in kooky
+				HttpOnly: kc.HttpOnly, // note the capitalization in kooky
 				// SameSite is optional; kooky has kc.SameSite (http.SameSite) if you want to copy it.
 			}
-
 			key := strings.ToLower(hc.Domain) + "\t" + hc.Path + "\t" + hc.Name
 			if seen[key] {
 				continue
@@ -77,7 +84,6 @@ func ForURL(ctx context.Context, rawURL string) ([]*http.Cookie, error) {
 			out = append(out, hc)
 		}
 	}
-
 	if len(out) == 0 {
 		return nil, fmt.Errorf("no cookies for %q found", host)
 	}
@@ -86,7 +92,21 @@ func ForURL(ctx context.Context, rawURL string) ([]*http.Cookie, error) {
 
 // WriteDump writes cookies as {"cookies":[...]} to the given path (0600 perms).
 func WriteDump(path string, cs []*http.Cookie) error {
-	b, err := json.MarshalIndent(cookieDump{Cookies: cs}, "", "  ")
+	var scs []savedCookie
+	for _, c := range cs {
+		sc := savedCookie{
+			Name:        c.Name,
+			ValueBase64: base64.StdEncoding.EncodeToString([]byte(c.Value)),
+			Path:        c.Path,
+			Domain:      c.Domain,
+			Expires:     c.Expires,
+			Secure:      c.Secure,
+			HttpOnly:    c.HttpOnly,
+			SameSite:    c.SameSite,
+		}
+		scs = append(scs, sc)
+	}
+	b, err := json.MarshalIndent(cookieDump{Cookies: scs}, "", " ")
 	if err != nil {
 		return err
 	}
