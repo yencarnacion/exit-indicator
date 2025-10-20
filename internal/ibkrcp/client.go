@@ -8,12 +8,15 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+    "net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"os"
 	"path/filepath"
 	"time"
+
+    "exit-indicator/internal/authbrowser"
 )
 
 type Client struct {
@@ -30,7 +33,11 @@ func NewClient(baseURL, sessionStorePath string, logger *slog.Logger) *Client {
 	jar, _ := cookiejar.New(nil)
 	// CP Gateway on 127.0.0.1: self-signed cert; allow insecure for local dev
 	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // #nosec G402 local gateway
+        TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // #nosec G402 local gateway
+        DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+            d := &net.Dialer{Timeout: 15 * time.Second}
+            return d.DialContext(ctx, "tcp4", addr) // force IPv4
+        },
 	}
 	httpc := &http.Client{Jar: jar, Transport: tr, Timeout: 15 * time.Second}
 	return &Client{
@@ -178,9 +185,34 @@ func (c *Client) Connect(ctx context.Context) error {
         return nil
     }
 
-    // Not authenticated yet → perform the validate → reauth → status dance
+    // Not authenticated yet → try programmatic validate/reauth/status first
     if err := c.ensureBrokerageSession(ctx); err != nil {
-        return fmt.Errorf("not authenticated in Client Portal Gateway: %w", err)
+        // Last resort: drive Chrome to complete SSO and seed our cookie jar
+        rl := 2
+        if os.Getenv("EXIT_INDICATOR_IBKR_RL") == "1" { rl = 1 }
+        abOpts := authbrowser.Options{
+            BaseURL:  c.baseURL,   // e.g. https://localhost:5001
+            RL:       rl,
+            Headless: false,       // show the window so you can do 2FA
+            Wait:     5 * time.Minute,
+        }
+        // Launch visible Chrome; complete 2FA, helper will inject cookies
+        if err2 := authbrowser.AcquireSessionCookie(ctx, c.jar, abOpts); err2 != nil {
+            return fmt.Errorf("not authenticated in Client Portal Gateway: %w", err2)
+        }
+        // Re-check status now that cookie jar is seeded
+        req, _ := http.NewRequestWithContext(ctx, http.MethodGet, c.url("/v1/api/iserver/auth/status"), nil)
+        resp, err3 := c.httpc.Do(req)
+        if err3 != nil {
+            return fmt.Errorf("auth status after browser: %w", err3)
+        }
+        defer resp.Body.Close()
+        var v map[string]any
+        _ = json.NewDecoder(resp.Body).Decode(&v)
+        if ok, _ := v["authenticated"].(bool); !ok {
+            return errors.New("authentication did not complete after browser flow")
+        }
+        c.saveSession()
     }
     return nil
 }
