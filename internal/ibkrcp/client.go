@@ -71,33 +71,118 @@ func (c *Client) url(p string) string {
 	return fmt.Sprintf("%s%s", c.baseURL, p)
 }
 
+// add below existing imports in client.go
+// "net/http"
+// "url"
+// "time"
+
+func (c *Client) do(ctx context.Context, method, path string, hdr http.Header) (*http.Response, error) {
+    req, _ := http.NewRequestWithContext(ctx, method, c.url(path), nil)
+    for k, vv := range hdr {
+        for _, v := range vv { req.Header.Add(k, v) }
+    }
+    return c.httpc.Do(req)
+}
+
+func (c *Client) originHeaders() http.Header {
+    h := make(http.Header)
+    // Origin/Referer should match the base URL host to mimic browser calls
+    u, _ := url.Parse(c.baseURL)
+    origin := u.Scheme + "://" + u.Host
+    h.Set("Origin", origin)
+    h.Set("Referer", origin+"/")
+    h.Set("X-Requested-With", "XMLHttpRequest")
+    h.Set("Accept", "application/json")
+    return h
+}
+
+// RL=1 (live), RL=2 (paper). Default 1, override via env EXIT_INDICATOR_IBKR_RL
+func rlParam() string {
+    if v := os.Getenv("EXIT_INDICATOR_IBKR_RL"); v == "2" {
+        return "2"
+    }
+    return "1"
+}
+
+// ensureBrokerageSession reproduces the IBeam dance (tickle → validate → reauth → status),
+// resilient to 204/401 and timing. It assumes the user already completed the browser login
+// on the SAME host+port as c.baseURL.
+func (c *Client) ensureBrokerageSession(ctx context.Context) error {
+    h := c.originHeaders()
+
+    // 0) seed cookie jar (tickle usually returns 401 but sets x-sess-uuid)
+    _, _ = c.do(ctx, http.MethodGet, "/v1/api/tickle", nil)
+
+    // 0b) (optional) hit the SSO login route to align context (does nothing if already logged in)
+    authPath := "/sso/Login?forwardTo=22&RL=" + rlParam() + "&ip2loc=on"
+    _, _ = c.do(ctx, http.MethodGet, authPath, h)
+
+    // Attempt validate → reauth → status a few times; some builds need a few seconds
+    const tries = 8
+    for i := 0; i < tries; i++ {
+        // 1) validate SSO (GET)
+        resp, err := c.do(ctx, http.MethodGet, "/v1/portal/sso/validate", h)
+        if err == nil {
+            _ = resp.Body.Close()
+        }
+        // 2) reauthenticate brokerage (POST)
+        resp, err = c.do(ctx, http.MethodPost, "/v1/portal/iserver/reauthenticate?force=true", h)
+        if err == nil {
+            _ = resp.Body.Close()
+        }
+
+        // 3) status (GET)
+        req, _ := http.NewRequestWithContext(ctx, http.MethodGet, c.url("/v1/api/iserver/auth/status"), nil)
+        resp, err = c.httpc.Do(req)
+        if err != nil {
+            time.Sleep(1500 * time.Millisecond)
+            continue
+        }
+        var v map[string]any
+        dec := json.NewDecoder(resp.Body)
+        _ = dec.Decode(&v)
+        _ = resp.Body.Close()
+
+        if ok, _ := v["authenticated"].(bool); ok {
+            // persist cookies for next runs
+            c.saveSession()
+            return nil
+        }
+
+        // Handle 204/empty or transient false → wait and retry
+        time.Sleep(1500 * time.Millisecond)
+    }
+    return errors.New("brokerage session did not authenticate after validate/reauth/status sequence")
+}
+
 func (c *Client) Connect(ctx context.Context) error {
-	// Load cookies from disk and test status
-	c.loadSession()
+    // Load cookies and try minimal status first
+    c.loadSession()
 
-	// hit /v1/api/iserver/auth/status – returns { "authenticated": bool, ... }
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, c.url("/v1/api/iserver/auth/status"), nil)
-	resp, err := c.httpc.Do(req)
-	if err != nil {
-		return fmt.Errorf("gateway unreachable: %w", err)
-	}
-	defer resp.Body.Close()
+    // status probe (some builds return 204/401 until validated)
+    req, _ := http.NewRequestWithContext(ctx, http.MethodGet, c.url("/v1/api/iserver/auth/status"), nil)
+    resp, err := c.httpc.Do(req)
+    if err != nil {
+        return fmt.Errorf("gateway unreachable: %w", err)
+    }
+    if resp.StatusCode >= 500 {
+        resp.Body.Close()
+        return fmt.Errorf("gateway status %d", resp.StatusCode)
+    }
+    var stat map[string]any
+    _ = json.NewDecoder(resp.Body).Decode(&stat)
+    resp.Body.Close()
 
-	if resp.StatusCode >= 500 {
-		return fmt.Errorf("gateway status %d", resp.StatusCode)
-	}
+    if ok, _ := stat["authenticated"].(bool); ok {
+        c.saveSession()
+        return nil
+    }
 
-	var v map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
-		return fmt.Errorf("decode auth status: %w", err)
-	}
-	auth, _ := v["authenticated"].(bool)
-	if !auth {
-		return errors.New("not authenticated in Client Portal Gateway. Open the Gateway UI and sign in, then retry")
-	}
-
-	c.saveSession()
-	return nil
+    // Not authenticated yet → perform the validate → reauth → status dance
+    if err := c.ensureBrokerageSession(ctx); err != nil {
+        return fmt.Errorf("not authenticated in Client Portal Gateway: %w", err)
+    }
+    return nil
 }
 
 // GetAccountID fetches and caches the first available accountId from the
