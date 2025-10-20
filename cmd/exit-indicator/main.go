@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/base64" // new import for base64
 	"errors"
 	"fmt"
 	"log/slog"

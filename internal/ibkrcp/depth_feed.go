@@ -1,7 +1,6 @@
 package ibkrcp
 
 import (
-	"errors"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -100,10 +99,16 @@ func (f *IBKRCPGatewayDepthFeed) Unsubscribe() {
     f.conid = 0
     f.mu.Unlock()
 
-    // Send a proper unsubscribe topic if possible, then close the socket.
-    if ws != nil && conid != 0 && acct != "" {
-        msg := fmt.Sprintf("ubd+%s+%d+SMART", acct, conid)
-        _ = ws.WriteMessage(websocket.TextMessage, []byte(msg))
+    // Send unsubscribe(s) if possible, then close the socket.
+    if ws != nil && conid != 0 {
+        if acct != "" {
+            _ = ws.WriteMessage(websocket.TextMessage, []byte(
+                fmt.Sprintf("ubd+%s+%d+SMART", acct, conid),
+            ))
+        }
+        _ = ws.WriteMessage(websocket.TextMessage, []byte(
+            fmt.Sprintf("ubd+%d+SMART", conid),
+        ))
     }
     if ws != nil {
         _ = ws.WriteMessage(websocket.CloseMessage,
@@ -236,33 +241,37 @@ func (f *IBKRCPGatewayDepthFeed) openWS() (*websocket.Conn, error) {
 // subscribeDepth sends a minimal subscription command. IBKR may change these specifics;
 // keep this isolated. The readLoop coalesces incoming messages into snapshots for the aggregator.
 func (f *IBKRCPGatewayDepthFeed) subscribeDepth(conid int64) error {
-    // IBKR Client Portal WS commonly uses string topics for book depth:
-    //   sbd+<accountId>+<conid>+SMART  (subscribe book depth)
-    //   ubd+<accountId>+<conid>+SMART  (unsubscribe)
-    // We stick to SMART aggregated depth as per requirements.
+    // IBKR Client Portal WS commonly uses string topics for book depth.
     f.mu.RLock()
     acct := f.acctId
     f.mu.RUnlock()
-    if acct == "" {
-        return errors.New("no account id available for depth subscription")
+    // Try both known topic formats.
+    // 1) With accountId (newer builds)
+    if acct != "" {
+        _ = f.wsConn.WriteMessage(websocket.TextMessage, []byte(
+            fmt.Sprintf("sbd+%s+%d+SMART", acct, conid),
+        ))
     }
-    cmd := fmt.Sprintf("sbd+%s+%d+SMART", acct, conid)
-    return f.wsConn.WriteMessage(websocket.TextMessage, []byte(cmd))
+    // 2) Without accountId (older/common builds)
+    return f.wsConn.WriteMessage(websocket.TextMessage, []byte(
+        fmt.Sprintf("sbd+%d+SMART", conid),
+    ))
 }
 
 type bookRow struct {
-	Side  string  `json:"side"`
-	Price float64 `json:"price"`
-	Size  int     `json:"size"`
-	Venue string  `json:"venue"`
-	Level int     `json:"level"`
+	Side     string  `json:"side"`
+	Price    float64 `json:"price"`
+	Size     int     `json:"size"`
+	Venue    string  `json:"venue"`	// some builds use "venue"
+	Exchange string  `json:"exchange"` // others use "exchange"
+	Level    int     `json:"level"`
 }
 
 type inboundWS struct {
 	Topic string    `json:"topic"`
 	Conid int64     `json:"conid"`
 	Rows  []bookRow `json:"rows"`
-	// Some IBKR variants send arrays of patches; we accept both full and partial.
+	Data  []bookRow `json:"data"` // many IBKR builds use "data" not "rows"
 }
 
 func (f *IBKRCPGatewayDepthFeed) readLoop() error {
@@ -311,18 +320,28 @@ func (f *IBKRCPGatewayDepthFeed) readLoop() error {
 
 		// Try to decode as inboundWS; if not, ignore (could be ack/heartbeat)
 		var msg inboundWS
-		if err := json.Unmarshal(data, &msg); err != nil || len(msg.Rows) == 0 {
+		if err := json.Unmarshal(data, &msg); err != nil {
+			continue
+		}
+		rows := msg.Rows
+		if len(rows) == 0 {
+			rows = msg.Data
+		}
+		if len(rows) == 0 {
 			continue
 		}
 
 		asks := make([]depth.DepthLevel, 0, 64)
 		bids := make([]depth.DepthLevel, 0, 64)
-		for _, r := range msg.Rows {
+		for _, r := range rows {
 			dl := depth.DepthLevel{
 				Side:  strings.ToUpper(r.Side),
 				Price: decimal.NewFromFloat(r.Price),
 				Size:  r.Size,
-				Venue: r.Venue,
+				Venue: func() string {
+					if r.Venue != "" { return r.Venue }
+					return r.Exchange
+				}(),
 				Level: r.Level,
 			}
 			if dl.Side == "ASK" {
