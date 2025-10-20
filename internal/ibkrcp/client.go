@@ -148,21 +148,72 @@ func (c *Client) probeStatus(ctx context.Context) (bool, error) {
 }
 
 func (c *Client) do(ctx context.Context, method, path string, hdr http.Header) (*http.Response, error) {
-	req, _ := http.NewRequestWithContext(ctx, method, c.url(path), nil)
-	for k, vv := range hdr {
-		for _, v := range vv {
-			req.Header.Add(k, v)
-		}
-	}
-	// Manually set Cookie header with raw values (no sanitization)
-	var cookieStrs []string
-	for _, ck := range c.sessionCookies {
-		cookieStrs = append(cookieStrs, ck.Name+"="+ck.Value)
-	}
-	if len(cookieStrs) > 0 {
-		req.Header.Set("Cookie", strings.Join(cookieStrs, "; "))
-	}
-	return c.httpc.Do(req)
+    fullURL := c.url(path)
+    req, _ := http.NewRequestWithContext(ctx, method, fullURL, nil)
+    for k, vv := range hdr {
+        for _, v := range vv {
+            req.Header.Add(k, v)
+        }
+    }
+    // Only attach cookies that actually match host/path and aren't expired.
+    if u, err := url.Parse(fullURL); err == nil {
+        host := u.Hostname()
+        var cookieStrs []string
+        now := time.Now()
+        for _, ck := range c.sessionCookies {
+            if ck == nil { continue }
+            if !cookieDomainMatches(host, ck.Domain) { continue }
+            if !cookiePathMatches(u.EscapedPath(), ck.Path) { continue }
+            if !ck.Expires.IsZero() && now.After(ck.Expires) { continue }
+            cookieStrs = append(cookieStrs, ck.Name+"="+ck.Value)
+        }
+        if len(cookieStrs) > 0 {
+            req.Header.Set("Cookie", strings.Join(cookieStrs, "; "))
+        }
+    }
+    resp, err := c.httpc.Do(req)
+    if err != nil { return nil, err }
+    // Merge Set-Cookie back into session and persist.
+    c.mergeSetCookies(resp, fullURL)
+    return resp, nil
+}
+
+func cookieDomainMatches(host, domain string) bool {
+    if domain == "" { return false }
+    hd := strings.TrimPrefix(strings.ToLower(host), ".")
+    d  := strings.TrimPrefix(strings.ToLower(domain), ".")
+    if hd == d { return true }
+    return strings.HasSuffix(hd, "."+d)
+}
+func cookiePathMatches(reqPath, cookiePath string) bool {
+    if cookiePath == "" || cookiePath == "/" { return true }
+    return strings.HasPrefix(reqPath, cookiePath)
+}
+func (c *Client) mergeSetCookies(resp *http.Response, requestURL string) {
+    if resp == nil { return }
+    u, _ := url.Parse(requestURL)
+    host := ""
+    if u != nil { host = u.Hostname() }
+    idx := make(map[string]int, len(c.sessionCookies))
+    for i, ck := range c.sessionCookies {
+        if ck == nil { continue }
+        key := strings.ToLower(strings.TrimPrefix(ck.Domain, ".")) + "|" + ck.Path + "|" + ck.Name
+        idx[key] = i
+    }
+    updated := false
+    for _, sc := range resp.Cookies() {
+        if sc == nil || sc.Name == "" { continue }
+        if sc.Domain == "" && host != "" { sc.Domain = host }
+        key := strings.ToLower(strings.TrimPrefix(sc.Domain, ".")) + "|" + sc.Path + "|" + sc.Name
+        if pos, ok := idx[key]; ok {
+            c.sessionCookies[pos] = sc
+        } else {
+            idx[key] = len(c.sessionCookies)
+            c.sessionCookies = append(c.sessionCookies, sc)
+        }
+        updated = true
+    }
+    if updated { c.saveSession() }
 }
 
 func (c *Client) originHeaders() http.Header {

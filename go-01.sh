@@ -9,10 +9,16 @@ if [ -f .env ]; then
   set +a
 fi
 
-rm -f ./data/session.json
-
-
-go run ./cmd/cookiedump --from-browser chrome \
-  --for https://localhost:5001 \
-  --out ./data/session.json
+URL="${1:-https://localhost:5001}"
+OUT="./data/session.json"
+TMP="$(mktemp "${OUT}.tmp.XXXXXX")"
+echo "Dumping cookies for ${URL}…"
+if go run ./cmd/cookiedump --from-browser chrome --for "${URL}" --out "${TMP}"; then
+  mv -f "${TMP}" "${OUT}"
+  echo "Updated ${OUT}"
+else
+  echo "cookie dump failed; leaving existing ${OUT} unchanged" >&2
+  rm -f "${TMP}"
+  exit 1
+fi
 
