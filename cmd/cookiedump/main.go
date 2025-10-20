@@ -1,39 +1,35 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
-	"net/http"
-	"net/url"
-	"os"
+	"time"
 
 	"exit-indicator/internal/cookies"
 )
 
 func main() {
-	var (
-		from = flag.String("from-browser", "chrome", `browser: chrome|chromium|edge|brave|opera (optionally append :/path/to/profile)`)
-		forURL = flag.String("for", "", "base URL whose cookies to extract (e.g., https://localhost:5001)")
-		out  = flag.String("out", "./data/session.json", "output file path (exit-indicator session.json format)")
-	)
+	from := flag.String("from-browser", "chrome", "browser name (hint; all supported browsers are scanned)")
+	forURL := flag.String("for", "", "URL to dump cookies for (e.g., https://localhost:5001)")
+	out := flag.String("out", "./data/session.json", "output JSON path for session cookies")
 	flag.Parse()
 
 	if *forURL == "" {
-		log.Fatal("required: --for <baseURL>, e.g. --for https://localhost:5001")
+		log.Fatal("--for URL is required")
 	}
-	if _, err := url.ParseRequestURI(*forURL); err != nil {
-		log.Fatalf("bad --for URL: %v", err)
-	}
+	_ = from // reserved for future: narrowing to a specific browser
 
-	cks, err := cookies.ExtractFromBrowser(*from, *forURL)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cs, err := cookies.ForURL(ctx, *forURL)
 	if err != nil {
-		log.Fatalf("extract: %v", err)
+		log.Fatalf("read cookies: %v", err)
 	}
-
-	if err := cookies.SaveAsSessionJSON(*out, cks); err != nil {
-		log.Fatalf("save: %v", err)
+	if err := cookies.WriteDump(*out, cs); err != nil {
+		log.Fatalf("write %s: %v", *out, err)
 	}
-
-	fmt.Printf("Saved %d cookies for %s to %s\n", len(cks), *forURL, *out)
+	fmt.Printf("Wrote %d cookies for %s to %s\n", len(cs), *forURL, *out)
 }
