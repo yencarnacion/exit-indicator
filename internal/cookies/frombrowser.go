@@ -48,29 +48,33 @@ func ForURL(ctx context.Context, rawURL string) ([]*http.Cookie, error) {
 	seen := make(map[string]bool)
 
 	for _, s := range stores {
-		// Pull cookies matching the domain suffix
 		kcs, _ := s.ReadCookies(
 			kooky.DomainHasSuffix(host),
-			kooky.Valid, // discard obviously invalid entries
+			kooky.Valid, // discard corrupt entries
 		)
 		for _, kc := range kcs {
-			hc := kc.HTTPCookie() // convert to net/http.Cookie
-
-			// filter expired
-			if !hc.Expires.IsZero() && now.After(hc.Expires) {
+			// Manual expiry filter
+			if !kc.Expires.IsZero() && now.After(kc.Expires) {
 				continue
 			}
+			// Convert kooky.Cookie -> net/http.Cookie
+			hc := &http.Cookie{
+				Name:     kc.Name,
+				Value:    kc.Value,
+				Domain:   kc.Domain,
+				Path:     kc.Path,
+				Expires:  kc.Expires,   // zero -> session cookie
+				Secure:   kc.Secure,
+				HttpOnly: kc.HttpOnly,  // note the capitalization in kooky
+				// SameSite is optional; kooky has kc.SameSite (http.SameSite) if you want to copy it.
+			}
 
-			// dedupe by domain+path+name (case-insensitive domain)
 			key := strings.ToLower(hc.Domain) + "\t" + hc.Path + "\t" + hc.Name
 			if seen[key] {
 				continue
 			}
 			seen[key] = true
-
-			// keep a pointer copy
-			c := hc // copy
-			out = append(out, &c)
+			out = append(out, hc)
 		}
 	}
 
@@ -90,4 +94,12 @@ func WriteDump(path string, cs []*http.Cookie) error {
 		return err
 	}
 	return os.WriteFile(path, b, 0o600)
+}
+
+// ExtractFromBrowser is a convenience wrapper used by main.go. For now we
+// ignore the specific browser name and just read from all stores.
+func ExtractFromBrowser(_ string, rawURL string) ([]*http.Cookie, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return ForURL(ctx, rawURL)
 }
