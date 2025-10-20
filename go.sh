@@ -9,6 +9,8 @@ if [ -f .env ]; then
   set +a
 fi
 
+export EXIT_INDICATOR_LOGIN_WAIT_SECONDS=900   # 15 minutes
+
 export EXIT_INDICATOR_IBKR_RL=2
 rm -f ./data/session.json
 

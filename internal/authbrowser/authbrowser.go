@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -13,6 +14,15 @@ import (
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/chromedp"
 )
+
+func loginWait() time.Duration {
+	if s := os.Getenv("EXIT_INDICATOR_LOGIN_WAIT_SECONDS"); s != "" {
+		if d, err := time.ParseDuration(s + "s"); err == nil && d > 0 {
+			return d
+		}
+	}
+	return 8 * time.Minute // default bigger window for 2FA
+}
 
 type Options struct {
 	BaseURL      string        // e.g. https://localhost:5001
@@ -31,7 +41,7 @@ func AcquireSessionCookie(ctx context.Context, httpJar *cookiejar.Jar, opts Opti
 		opts.RL = 2 // default to paper
 	}
 	wait := opts.Wait
-	if wait <= 0 { wait = 3 * time.Minute }
+	if wait <= 0 { wait = loginWait() }
 
 	// Chrome context
 	allocOpts := []chromedp.ExecAllocatorOption{
@@ -74,55 +84,57 @@ func AcquireSessionCookie(ctx context.Context, httpJar *cookiejar.Jar, opts Opti
 		return fmt.Errorf("navigate login: %w", err)
 	}
 
-	// 2) Wait for user to complete 2FA: we poll status via XHRs in page context.
-	//    We'll call validate→reauth from the page context (fetch with credentials)
-	//    to ensure browser session is used, then we’ll export cookies to Go jar.
-
-	// Helper JS executed in page: perform validate → reauth → status and return final JSON text
-	jsFlow := fmt.Sprintf(`
-(async () => {
-  try {
-    // validate
-    await fetch('%s', { credentials: 'include' });
-    // reauth
-    await fetch('%s', { method: 'POST', credentials: 'include' });
-    // poll status a few times
-    let out = null;
-    for (let i=0;i<10;i++) {
-      const r = await fetch('%s', { credentials: 'include' });
-      if (r.ok) {
-        const t = await r.text();
-        try {
-          const j = JSON.parse(t);
-          if (j && j.authenticated === true) { out = t; break; }
-        } catch(_) {}
-      }
-      await new Promise(res => setTimeout(res, 1500));
+    // 2) Wait for the interactive SSO to complete.
+    // We poll location until we leave the login page/dispatcher; then we run validate→reauth→status.
+    var loc string
+    for i := 0; i < 200; i++ { // ~200 * 2s = ~400s inside the overall 'wait'
+        _ = chromedp.Run(cctx, chromedp.Evaluate(`window.location.pathname || ""`, &loc))
+        // once user finished 2FA, the page is no longer the /sso/Login route; often via /sso/Dispatcher then UI
+        if !strings.Contains(loc, "/sso/Login") {
+            break
+        }
+        time.Sleep(2 * time.Second)
     }
-    return out || '';
+
+    // 3) Now perform validate→reauth→status in page context (uses browser cookies).
+    jsFlow := fmt.Sprintf(`
+(async () => {
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  try {
+    for (let k=0;k<3;k++) { // a couple of tries
+      await fetch('%s', { credentials: 'include' });
+      await fetch('%s', { method: 'POST', credentials: 'include' });
+      for (let i=0;i<20;i++) { // up to ~30s (20 * 1500ms)
+        const r = await fetch('%s', { credentials: 'include' });
+        if (r.ok) {
+          const t = await r.text();
+          try {
+            const j = JSON.parse(t);
+            if (j && j.authenticated === true) return t;
+          } catch (_) {}
+        }
+        await sleep(1500);
+      }
+    }
+    return '';
   } catch(e) {
     return '';
   }
 })()
 `, jsEscape(validateURL), jsEscape(reauthURL), jsEscape(statusURL))
 
-	var finalJSON string
-	// We loop: user completes 2FA in visible browser → our JS succeeds
-	for i := 0; i < 30; i++ { // up to ~45s polling here; outer context has full timeout
-		if err := chromedp.Run(cctx,
-			// Try running the JS flow; it silently returns '' until login actually finished
-			chromedp.Evaluate(jsFlow, &finalJSON),
-		); err != nil {
-			// ignore transient errors; small wait then retry
-		}
-		if strings.Contains(finalJSON, `"authenticated":true`) {
-			break
-		}
-		time.Sleep(1500 * time.Millisecond)
-	}
-	if !strings.Contains(finalJSON, `"authenticated":true`) {
-		return errors.New("browser flow did not reach authenticated:true (did you finish 2FA?)")
-	}
+    var finalJSON string
+    // 4) Run the flow once; if it doesn't flip yet, we keep nudging it a few more times.
+    for i := 0; i < 6; i++ { // ~6 * 5s ≈ 30s; outer context still has long timeout
+        _ = chromedp.Run(cctx, chromedp.Evaluate(jsFlow, &finalJSON))
+        if strings.Contains(finalJSON, `"authenticated":true`) {
+            break
+        }
+        time.Sleep(5 * time.Second)
+    }
+    if !strings.Contains(finalJSON, `"authenticated":true`) {
+        return errors.New("browser flow did not reach authenticated:true (finish 2FA, or extend EXIT_INDICATOR_LOGIN_WAIT_SECONDS)")
+    }
 
     // 3) Export cookies from Chrome and inject into our Go http jar for the base host.
     // Use GetCookies (works across cdproto versions); scope by URL.
