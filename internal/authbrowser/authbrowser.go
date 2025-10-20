@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+    "crypto/tls"
+    "encoding/json"
     "log/slog"
 	"os"
 	"net/http"
@@ -15,6 +17,31 @@ import (
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/chromedp"
 )
+
+// pollGatewayStatus uses the provided cookie jar to hit /auth/status until it returns authenticated:true or timeout.
+func pollGatewayStatus(ctx context.Context, baseURL string, jar *cookiejar.Jar, timeout time.Duration) (bool, error) {
+    // Same TLS + timeout semantics as the main client
+    tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}} // local self-signed
+    httpc := &http.Client{Jar: jar, Transport: tr, Timeout: 8 * time.Second}
+
+    deadline := time.Now().Add(timeout)
+    for time.Now().Before(deadline) {
+        req, _ := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/v1/api/iserver/auth/status", nil)
+        resp, err := httpc.Do(req)
+        if err == nil {
+            var v map[string]any
+            if resp.Body != nil {
+                _ = json.NewDecoder(resp.Body).Decode(&v)
+                resp.Body.Close()
+            }
+            if ok, _ := v["authenticated"].(bool); ok {
+                return true, nil
+            }
+        }
+        time.Sleep(2 * time.Second)
+    }
+    return false, nil
+}
 
 func loginWait() time.Duration {
 	if s := os.Getenv("EXIT_INDICATOR_LOGIN_WAIT_SECONDS"); s != "" {
@@ -167,32 +194,53 @@ func AcquireSessionCookie(ctx context.Context, httpJar *cookiejar.Jar, opts Opti
     }
 
     // 3) Export cookies from Chrome and inject into our Go http jar for the base host.
-    // Use GetCookies (works across newer cdproto versions); scope by URL.
-    cks, err := network.GetCookies().WithURLs([]string{opts.BaseURL}).Do(cctx)
-    if err != nil {
-        return fmt.Errorf("get cookies: %w", err)
+    syncCookies := func() error {
+        cks, err := network.GetCookies().WithURLs([]string{opts.BaseURL}).Do(cctx)
+        if err != nil {
+            return fmt.Errorf("get cookies: %w", err)
+        }
+        var httpCookies []*http.Cookie
+        for _, ck := range cks {
+            httpCookies = append(httpCookies, &http.Cookie{
+                Name:     ck.Name,
+                Value:    ck.Value,
+                Path:     ck.Path,
+                Secure:   ck.Secure,
+                HttpOnly: ck.HTTPOnly,
+                Expires: func() time.Time {
+                    if ck.Expires == 0 { return time.Time{} }
+                    return time.Unix(int64(ck.Expires), 0)
+                }(),
+            })
+        }
+        httpJar.SetCookies(u, httpCookies)
+        return nil
     }
 
-    var httpCookies []*http.Cookie
-    for _, ck := range cks {
-        // Scope cookies to the exact request URL host (leave Domain empty).
-        httpCookies = append(httpCookies, &http.Cookie{
-            Name:     ck.Name,
-            Value:    ck.Value,
-            Path:     ck.Path,
-            Secure:   ck.Secure,
-            HttpOnly: ck.HTTPOnly,
-			// In your chromedp/cdproto, Expires is a float64 (seconds since epoch). 0 => session cookie.
-			Expires: func() time.Time {
-				if ck.Expires == 0 {
-					return time.Time{}
-				}
-				return time.Unix(int64(ck.Expires), 0)
-			}(),
-        })
+    // First sync once
+    if err := syncCookies(); err != nil {
+        return err
     }
-    httpJar.SetCookies(u, httpCookies)
-    return nil
+
+    // 4) Final assurance: poll /auth/status from Go using the synced cookies.
+    // Give this a short window (e.g., 2 minutes or whatever remains from 'wait').
+    remain := time.Until(time.Now().Add(2 * time.Minute))
+    if remain <= 0 { remain = 2 * time.Minute }
+
+    ok, _ := pollGatewayStatus(cctx, opts.BaseURL, httpJar, remain)
+    if ok {
+        return nil
+    }
+
+    // If still false, do a few more sync+poll rounds in case the page set late cookies.
+    for i := 0; i < 5; i++ {
+        _ = syncCookies()
+        if ok, _ = pollGatewayStatus(cctx, opts.BaseURL, httpJar, 15*time.Second); ok {
+            return nil
+        }
+    }
+
+    return errors.New("browser flow did not reach authenticated:true (finish 2FA, or extend EXIT_INDICATOR_LOGIN_WAIT_SECONDS)")
 }
 
 // helper to make the JS string safe
