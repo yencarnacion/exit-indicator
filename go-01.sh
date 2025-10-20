@@ -9,6 +9,8 @@ if [ -f .env ]; then
   set +a
 fi
 
+rm -f ./data/session.json
+
 
 go run ./cmd/cookiedump --from-browser chrome \
   --for https://localhost:5001 \
