@@ -86,6 +86,28 @@ func (c *Client) url(p string) string {
 	return fmt.Sprintf("%s%s", c.baseURL, p)
 }
 
+// probeStatus checks both API and Portal auth status endpoints using browser-like headers.
+func (c *Client) probeStatus(ctx context.Context) (bool, error) {
+    h := c.originHeaders()
+    if resp, err := c.do(ctx, http.MethodGet, "/v1/api/iserver/auth/status", h); err == nil {
+        defer resp.Body.Close()
+        var v map[string]any
+        _ = json.NewDecoder(resp.Body).Decode(&v)
+        if ok, _ := v["authenticated"].(bool); ok {
+            return true, nil
+        }
+    }
+    if resp, err := c.do(ctx, http.MethodGet, "/v1/portal/iserver/auth/status", h); err == nil {
+        defer resp.Body.Close()
+        var v map[string]any
+        _ = json.NewDecoder(resp.Body).Decode(&v)
+        if ok, _ := v["authenticated"].(bool); ok {
+            return true, nil
+        }
+    }
+    return false, nil
+}
+
 // add below existing imports in client.go
 // "net/http"
 // "url"
@@ -152,23 +174,12 @@ func (c *Client) ensureBrokerageSession(ctx context.Context) error {
             }
         }
 
-        // 3) status (GET)
-        req, _ := http.NewRequestWithContext(ctx, http.MethodGet, c.url("/v1/api/iserver/auth/status"), nil)
-        resp, err = c.httpc.Do(req)
-        if err != nil {
-            time.Sleep(1500 * time.Millisecond)
-            continue
-        }
-        var v map[string]any
-        dec := json.NewDecoder(resp.Body)
-        _ = dec.Decode(&v)
-        _ = resp.Body.Close()
-
-        if ok, _ := v["authenticated"].(bool); ok {
-            // persist cookies for next runs
-            c.saveSession()
-            return nil
-        }
+    // 3) status (GET) – try API first, then Portal
+    if ok, _ := c.probeStatus(ctx); ok {
+        // persist cookies for next runs
+        c.saveSession()
+        return nil
+    }
 
         // Handle 204/empty or transient false → wait and retry
         time.Sleep(1500 * time.Millisecond)
@@ -180,9 +191,8 @@ func (c *Client) Connect(ctx context.Context) error {
     // Load cookies and try minimal status first
     c.loadSession()
 
-    // status probe (some builds return 204/401 until validated)
-    req, _ := http.NewRequestWithContext(ctx, http.MethodGet, c.url("/v1/api/iserver/auth/status"), nil)
-    resp, err := c.httpc.Do(req)
+    // Probe status via API then Portal
+    ok, err := c.probeStatus(ctx)
     if err != nil {
         // Try a one-shot browser-assisted login to nudge the gateway into a session
         rl := 2
@@ -197,22 +207,13 @@ func (c *Client) Connect(ctx context.Context) error {
         if err2 := authbrowser.AcquireSessionCookie(ctx, c.jar, abOpts); err2 != nil {
             return fmt.Errorf("gateway unreachable: %w", err)
         }
-        // Re-check status after browser flow
-        req, _ = http.NewRequestWithContext(ctx, http.MethodGet, c.url("/v1/api/iserver/auth/status"), nil)
-        resp, err = c.httpc.Do(req)
+        // Re-probe after browser flow
+        ok, err = c.probeStatus(ctx)
         if err != nil {
             return fmt.Errorf("gateway unreachable after browser flow: %w", err)
         }
     }
-    if resp.StatusCode >= 500 {
-        resp.Body.Close()
-        return fmt.Errorf("gateway status %d", resp.StatusCode)
-    }
-    var stat map[string]any
-    _ = json.NewDecoder(resp.Body).Decode(&stat)
-    resp.Body.Close()
-
-    if ok, _ := stat["authenticated"].(bool); ok {
+    if ok {
         c.saveSession()
         return nil
     }
@@ -233,16 +234,8 @@ func (c *Client) Connect(ctx context.Context) error {
         if err2 := authbrowser.AcquireSessionCookie(ctx, c.jar, abOpts); err2 != nil {
             return fmt.Errorf("not authenticated in Client Portal Gateway: %w", err2)
         }
-        // Re-check status now that cookie jar is seeded
-        req, _ := http.NewRequestWithContext(ctx, http.MethodGet, c.url("/v1/api/iserver/auth/status"), nil)
-        resp, err3 := c.httpc.Do(req)
-        if err3 != nil {
-            return fmt.Errorf("auth status after browser: %w", err3)
-        }
-        defer resp.Body.Close()
-        var v map[string]any
-        _ = json.NewDecoder(resp.Body).Decode(&v)
-        if ok, _ := v["authenticated"].(bool); !ok {
+        // Re-check status now that cookie jar is seeded (API or Portal)
+        if ok, _ := c.probeStatus(ctx); !ok {
             return errors.New("authentication did not complete after browser flow")
         }
         c.saveSession()

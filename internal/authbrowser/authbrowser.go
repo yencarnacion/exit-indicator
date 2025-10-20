@@ -114,12 +114,14 @@ func AcquireSessionCookie(ctx context.Context, httpJar *cookiejar.Jar, opts Opti
 	cctx, timeoutCancel := context.WithTimeout(cctx, wait)
 	defer timeoutCancel()
 
-	loginURL := fmt.Sprintf("%s/sso/Login?forwardTo=22&RL=%d&ip2loc=on", opts.BaseURL, opts.RL)
-	validateURL := opts.BaseURL + "/v1/portal/sso/validate"
+    loginURL := fmt.Sprintf("%s/sso/Login?forwardTo=22&RL=%d&ip2loc=on", opts.BaseURL, opts.RL)
+    validateURL := opts.BaseURL + "/v1/portal/sso/validate"
+    tickleURL   := opts.BaseURL + "/v1/api/tickle"
     // Prefer the /v1/api route, but fall back to /v1/portal if needed
     reauthURLPrimary  := opts.BaseURL + "/v1/api/iserver/reauthenticate?force=true"
     reauthURLFallback := opts.BaseURL + "/v1/portal/iserver/reauthenticate?force=true"
-	statusURL := opts.BaseURL + "/v1/api/iserver/auth/status"
+    statusURL1 := opts.BaseURL + "/v1/api/iserver/auth/status"
+    statusURL2 := opts.BaseURL + "/v1/portal/iserver/auth/status"
 
 	// Enable network domain to fetch HttpOnly cookies
 	if err := chromedp.Run(cctx, network.Enable()); err != nil {
@@ -131,12 +133,23 @@ func AcquireSessionCookie(ctx context.Context, httpJar *cookiejar.Jar, opts Opti
 		return fmt.Errorf("navigate login: %w", err)
 	}
 
-    // 2) Perform validate→reauth→status in page context (uses browser cookies).
+    // 2) Perform tickle + validate→reauth→status (API & Portal) in page context (uses browser cookies).
     jsFlow := fmt.Sprintf(`
 (async () => {
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  const check = async (u) => {
+    try {
+      const r = await fetch(u, { credentials: 'include' });
+      if (!r.ok) return '';
+      const t = await r.text();
+      try { const j = JSON.parse(t); if (j && j.authenticated === true) return t; } catch (_) {}
+    } catch(_) {}
+    return '';
+  };
   try {
-    for (let k=0;k<3;k++) { // a couple of tries
+    // seed session
+    try { await fetch('%s', { credentials: 'include' }); } catch(_) {}
+    for (let k=0;k<4;k++) {
       await fetch('%s', { credentials: 'include' });           // validate
       let ok = false;
       try {
@@ -149,15 +162,9 @@ func AcquireSessionCookie(ctx context.Context, httpJar *cookiejar.Jar, opts Opti
           ok = r2 && (r2.ok || r2.status === 204);
         } catch (_) {}
       }
-      for (let i=0;i<20;i++) { // up to ~30s (20 * 1500ms)
-        const r = await fetch('%s', { credentials: 'include' }); // status
-        if (r.ok) {
-          const t = await r.text();
-          try {
-            const j = JSON.parse(t);
-            if (j && j.authenticated === true) return t;
-          } catch (_) {}
-        }
+      for (let i=0;i<24;i++) { // ~36s per outer try
+        let t = await check('%s'); if (!t) t = await check('%s');
+        if (t) return t;
         await sleep(1500);
       }
     }
@@ -166,7 +173,7 @@ func AcquireSessionCookie(ctx context.Context, httpJar *cookiejar.Jar, opts Opti
     return '';
   }
 })()
-`, jsEscape(validateURL), jsEscape(reauthURLPrimary), jsEscape(reauthURLFallback), jsEscape(statusURL))
+`, jsEscape(tickleURL), jsEscape(validateURL), jsEscape(reauthURLPrimary), jsEscape(reauthURLFallback), jsEscape(statusURL1), jsEscape(statusURL2))
 
     var finalJSON string
     // 4) Run the flow once; if it doesn't flip yet, we keep nudging it a few more times.
