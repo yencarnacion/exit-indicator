@@ -9,6 +9,7 @@ require (
 	github.com/chromedp/chromedp v0.14.2
 	github.com/gorilla/websocket v1.5.1
 	github.com/joho/godotenv v1.5.1
+	github.com/zellyn/kooky v0.6.0
 	github.com/shopspring/decimal v1.3.1
 	gopkg.in/yaml.v3 v3.0.1
 )

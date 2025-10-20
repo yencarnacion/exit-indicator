@@ -304,3 +304,11 @@ func (c *Client) HTTPClient() *http.Client { return c.httpc }
 func (c *Client) BaseURL() string          { return c.baseURL }
 
 
+
+// InjectCookies seeds the client's cookie jar for its baseURL and persists to session_store_path.
+func (c *Client) InjectCookies(cookies []*http.Cookie) {
+    u, _ := url.Parse(c.baseURL)
+    c.jar.SetCookies(u, cookies)
+    c.saveSession()
+}
+

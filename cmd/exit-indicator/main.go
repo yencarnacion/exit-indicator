@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"exit-indicator/internal/config"
+    "exit-indicator/internal/cookies"
 	"exit-indicator/internal/depth"
 	"exit-indicator/internal/ibkrcp"
 	"exit-indicator/internal/server"
@@ -38,6 +39,25 @@ func main() {
 		slog.String("ibkr_gateway_url", cfg.IBKRGatewayURL),
 	)
 
+    // Optional: import cookies from a local browser, like yt-dlp:
+    //
+    //   go run ./cmd/exit-indicator/main.go --cookies-from-browser chrome https://localhost:5001
+    //
+    var importBrowser string
+    var importBaseURL string
+    args := os.Args[1:]
+    for i := 0; i < len(args); i++ {
+        if args[i] == "--cookies-from-browser" && i+2 < len(args) {
+            importBrowser = args[i+1]
+            importBaseURL = args[i+2]
+            i += 2
+        }
+    }
+    if importBaseURL != "" {
+        // If user passed a URL, prefer it over config.yaml's ibkr_gateway_url.
+        cfg.IBKRGatewayURL = importBaseURL
+    }
+
 	// State
 	st := state.NewState(time.Duration(cfg.CooldownSeconds)*time.Second, cfg.DefaultThresholdShares)
 
@@ -47,9 +67,25 @@ func main() {
 		logger.Warn("sound manager init", slog.String("err", err.Error()))
 	}
 
-	// IBKR client + feed
-	client := ibkrcp.NewClient(cfg.IBKRGatewayURL, cfg.SessionStorePath, logger)
-	feed := ibkrcp.NewGatewayDepthFeed(client, logger)
+    // IBKR client + feed
+    client := ibkrcp.NewClient(cfg.IBKRGatewayURL, cfg.SessionStorePath, logger)
+
+    // If requested, import cookies from a local browser (Chrome/Edge/Brave/Chromium).
+    if importBrowser != "" && cfg.IBKRGatewayURL != "" {
+        if cookies, err := cookies.ExtractFromBrowser(importBrowser, cfg.IBKRGatewayURL); err != nil {
+            logger.Error("cookie import failed", slog.String("err", err.Error()))
+        } else {
+            client.InjectCookies(cookies)
+            logger.Info("imported cookies from browser",
+                slog.String("browser", importBrowser),
+                slog.Int("count", len(cookies)),
+                slog.String("base_url", cfg.IBKRGatewayURL),
+                slog.String("session_store", cfg.SessionStorePath),
+            )
+        }
+    }
+
+    feed := ibkrcp.NewGatewayDepthFeed(client, logger)
 
 	// Optional: one-shot login mode to acquire/refresh session and exit.
 	for _, a := range os.Args[1:] {
