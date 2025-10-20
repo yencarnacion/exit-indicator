@@ -31,7 +31,7 @@ type Client struct {
 	logger         *slog.Logger
 	sessionPath    string
 	sessionCookies []*http.Cookie // raw cookies; we manually handle headers to avoid sanitization
-	lastSessionID  string         // session id returned by /tickle (used to auth the websocket)
+	lastSessionID  string         // websocket session id from /tickle
 }
 
 func NewClient(baseURL, sessionStorePath string, logger *slog.Logger) *Client {
@@ -57,6 +57,16 @@ func NewClient(baseURL, sessionStorePath string, logger *slog.Logger) *Client {
 		logger:      logger,
 		sessionPath: sessionStorePath,
 	}
+}
+
+// Only allow launching a helper browser if EXIT_INDICATOR_AUTO_BROWSER is truthy.
+func autoBrowserAllowed() bool {
+	v := strings.TrimSpace(os.Getenv("EXIT_INDICATOR_AUTO_BROWSER"))
+	switch strings.ToLower(v) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 func (c *Client) loadSession() {
@@ -128,8 +138,55 @@ func (c *Client) url(p string) string {
 	return fmt.Sprintf("%s%s", c.baseURL, p)
 }
 
-// probeStatus checks auth status using the documented POST (/v1/api/iserver/auth/status).
-// Older builds sometimes expose a /v1/portal fallback; we keep it as a safety net, also with POST.
+// doJSON is like do() but sends a JSON body and sets Content-Type.
+func (c *Client) doJSON(ctx context.Context, method, path string, body any, hdr http.Header) (*http.Response, error) {
+	fullURL := c.url(path)
+	var buf bytes.Buffer
+	if body != nil {
+		if err := json.NewEncoder(&buf).Encode(body); err != nil {
+			return nil, err
+		}
+	}
+	req, _ := http.NewRequestWithContext(ctx, method, fullURL, &buf)
+	for k, vv := range hdr {
+		for _, v := range vv {
+			req.Header.Add(k, v)
+		}
+	}
+	req.Header.Set("Content-Type", "application/json")
+	// Attach matching cookies (same as do()).
+	if u, err := url.Parse(fullURL); err == nil {
+		host := u.Hostname()
+		var cookieStrs []string
+		now := time.Now()
+		for _, ck := range c.sessionCookies {
+			if ck == nil {
+				continue
+			}
+			if !cookieDomainMatches(host, ck.Domain) {
+				continue
+			}
+			if !cookiePathMatches(u.EscapedPath(), ck.Path) {
+				continue
+			}
+			if !ck.Expires.IsZero() && now.After(ck.Expires) {
+				continue
+			}
+			cookieStrs = append(cookieStrs, ck.Name+"="+ck.Value)
+		}
+		if len(cookieStrs) > 0 {
+			req.Header.Set("Cookie", strings.Join(cookieStrs, "; "))
+		}
+	}
+	resp, err := c.httpc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	c.mergeSetCookies(resp, fullURL)
+	return resp, nil
+}
+
+// probeStatus checks both API and Portal auth status endpoints using browser-like headers.
 func (c *Client) probeStatus(ctx context.Context) (bool, error) {
 	h := c.originHeaders()
 	if resp, err := c.do(ctx, http.MethodPost, "/v1/api/iserver/auth/status", h); err == nil {
@@ -140,42 +197,12 @@ func (c *Client) probeStatus(ctx context.Context) (bool, error) {
 			return true, nil
 		}
 	}
-	if resp, err := c.do(ctx, http.MethodPost, "/v1/portal/iserver/auth/status", h); err == nil {
-		defer resp.Body.Close()
-		var v map[string]any
-		_ = json.NewDecoder(resp.Body).Decode(&v)
-		if ok, _ := v["authenticated"].(bool); ok {
-			return true, nil
-		}
-	}
 	return false, nil
 }
 
-// doJSON sends a JSON body with Content-Type: application/json.
-func (c *Client) doJSON(ctx context.Context, method, path string, body any, hdr http.Header) (*http.Response, error) {
-	var buf bytes.Buffer
-	if body != nil {
-		if err := json.NewEncoder(&buf).Encode(body); err != nil {
-			return nil, err
-		}
-	}
-	if hdr == nil {
-		hdr = make(http.Header)
-	}
-	if hdr.Get("Content-Type") == "" {
-		hdr.Set("Content-Type", "application/json")
-	}
-	return c.doWithBody(ctx, method, path, &buf, hdr)
-}
-
-// do is retained for empty-body requests (delegates to doWithBody).
 func (c *Client) do(ctx context.Context, method, path string, hdr http.Header) (*http.Response, error) {
-	return c.doWithBody(ctx, method, path, nil, hdr)
-}
-
-func (c *Client) doWithBody(ctx context.Context, method, path string, body io.Reader, hdr http.Header) (*http.Response, error) {
 	fullURL := c.url(path)
-	req, _ := http.NewRequestWithContext(ctx, method, fullURL, body)
+	req, _ := http.NewRequestWithContext(ctx, method, fullURL, nil)
 	for k, vv := range hdr {
 		for _, v := range vv {
 			req.Header.Add(k, v)
@@ -261,6 +288,7 @@ func (c *Client) originHeaders() http.Header {
 	h.Set("Referer", origin+"/")
 	h.Set("X-Requested-With", "XMLHttpRequest")
 	h.Set("Accept", "application/json")
+	h.Set("User-Agent", "exit-indicator/ibkrcp")
 	return h
 }
 
@@ -277,34 +305,30 @@ func rlParam() string {
 // on the SAME host+port as c.baseURL.
 func (c *Client) ensureBrokerageSession(ctx context.Context) error {
 	h := c.originHeaders()
-
-	// 0) seed/refresh session (POST /v1/api/tickle) and capture session id if present
-	if resp, err := c.do(ctx, http.MethodPost, "/v1/api/tickle", nil); err == nil {
-		func() {
-			defer resp.Body.Close()
-			var t struct{ Session string `json:"session"` }
-			if err := json.NewDecoder(resp.Body).Decode(&t); err == nil && t.Session != "" {
-				c.lastSessionID = t.Session
-			}
-		}()
-	}
-
+	// 0) keepalive/seed session id (docs: POST /v1/api/tickle)
+	_, _ = c.RefreshSessionID(ctx)
 	// Attempt validate → reauth → status a few times; some builds need a few seconds
 	const tries = 8
 	for i := 0; i < tries; i++ {
 		// 1) validate SSO (GET /v1/api/sso/validate)
-		if resp, err := c.do(ctx, http.MethodGet, "/v1/api/sso/validate", h); err == nil {
+		resp, err := c.do(ctx, http.MethodGet, "/v1/api/sso/validate", h)
+		if err == nil {
 			_ = resp.Body.Close()
 		}
-		// 2) reauthenticate brokerage (POST /v1/api/iserver/reauthenticate)
-		if resp, err := c.do(ctx, http.MethodPost, "/v1/api/iserver/reauthenticate?force=true", h); err == nil {
+		// 2) reauthenticate brokerage (POST /v1/api/iserver/reauthenticate?force=true)
+		resp, err = c.do(ctx, http.MethodPost, "/v1/api/iserver/reauthenticate?force=true", h)
+		if err == nil {
 			_ = resp.Body.Close()
 		}
-		// 3) status (POST per docs)
+		// 3) status (GET) – try API first, then Portal
 		if ok, _ := c.probeStatus(ctx); ok {
+			// persist cookies for next runs
 			c.saveSession()
+			// (optional) refresh session id after auth
+			_, _ = c.RefreshSessionID(ctx)
 			return nil
 		}
+		// Handle 204/empty or transient false → wait and retry
 		time.Sleep(1500 * time.Millisecond)
 	}
 	return errors.New("brokerage session did not authenticate after validate/reauth/status sequence")
@@ -315,16 +339,10 @@ func (c *Client) Connect(ctx context.Context) error {
 	c.loadSession()
 	// Probe status via API then Portal
 	ok, err := c.probeStatus(ctx)
-	skipBrowser := func() bool {
-		s := os.Getenv("EXIT_INDICATOR_LOGIN_WAIT_SECONDS")
-		if s == "" { return false }
-		w, err := strconv.Atoi(s)
-		if err != nil { return false }
-		return w <= 0
-	}()
+	browserOK := autoBrowserAllowed()
 	if err != nil {
-		if skipBrowser {
-			return fmt.Errorf("gateway unreachable (browser disabled): %w", err)
+		if !browserOK {
+			return fmt.Errorf("gateway unreachable (auto-browser disabled): %w", err)
 		}
 		// Try a one-shot browser-assisted login to nudge the gateway into a session
 		rl := 2
@@ -352,12 +370,13 @@ func (c *Client) Connect(ctx context.Context) error {
 	}
 	if ok {
 		c.saveSession()
+		_, _ = c.RefreshSessionID(ctx)
 		return nil
 	}
 	// Not authenticated yet → try programmatic validate/reauth/status first
 	if err := c.ensureBrokerageSession(ctx); err != nil {
-		if skipBrowser {
-			return fmt.Errorf("not authenticated in Client Portal Gateway (browser disabled): %w", err)
+		if !browserOK {
+			return fmt.Errorf("not authenticated in Client Portal Gateway (auto-browser disabled): %w", err)
 		}
 		// Last resort: drive Chrome to complete SSO and seed our cookie jar
 		rl := 2
@@ -383,6 +402,7 @@ func (c *Client) Connect(ctx context.Context) error {
 			return errors.New("authentication did not complete after browser flow")
 		}
 		c.saveSession()
+		_, _ = c.RefreshSessionID(ctx)
 	}
 	return nil
 }
@@ -402,18 +422,18 @@ func (c *Client) GetAccountID(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("iserver/accounts status %d", resp.StatusCode)
 	}
 	var v struct {
-		Accounts []string `json:"accounts"`
-		Selected string   `json:"selectedAccount"`
+		Accounts        []string `json:"accounts"`
+		SelectedAccount string   `json:"selectedAccount"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
 		return "", err
 	}
-	acct := v.Selected
+	acct := v.SelectedAccount
 	if acct == "" && len(v.Accounts) > 0 {
 		acct = v.Accounts[0]
 	}
 	if acct == "" {
-		return "", errors.New("no tradeable accounts found")
+		return "", errors.New("no tradeable account found")
 	}
 	c.acctId = acct
 	return acct, nil
@@ -421,9 +441,9 @@ func (c *Client) GetAccountID(ctx context.Context) (string, error) {
 
 // Minimal secdef search to map symbol→conid (STK). Picks the first STK result.
 func (c *Client) ConidForSymbol(ctx context.Context, symbol string) (int64, error) {
-	// Per docs: POST /iserver/secdef/search with JSON body {"symbol":"AAPL"}
-	resp, err := c.doJSON(ctx, http.MethodPost, "/v1/api/iserver/secdef/search",
-		map[string]any{"symbol": symbol}, c.originHeaders())
+	// Per docs this is POST with JSON body {"symbol": "<SYMBOL>"}.
+	payload := map[string]any{"symbol": strings.ToUpper(strings.TrimSpace(symbol))}
+	resp, err := c.doJSON(ctx, http.MethodPost, "/v1/api/iserver/secdef/search", payload, c.originHeaders())
 	if err != nil {
 		return 0, err
 	}
@@ -431,36 +451,18 @@ func (c *Client) ConidForSymbol(ctx context.Context, symbol string) (int64, erro
 	if resp.StatusCode != 200 {
 		return 0, fmt.Errorf("secdef search status %d", resp.StatusCode)
 	}
-	// Response is an array; STK presence may be in top-level "secType" or under "sections[*].secType"
 	var results []struct {
-		Conid    int64  `json:"conid"`
-		SecType  string `json:"secType"`
-		Symbol   string `json:"symbol"`
-		Sections []struct {
-			SecType string `json:"secType"`
-			Symbol  string `json:"symbol"`
-		} `json:"sections"`
+		Conid int64 `json:"conid"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {
 		return 0, err
 	}
-	symUpper := strings.ToUpper(symbol)
-	choose := func(r any) bool { return true }
-	for _, r := range results {
-		// Prefer exact symbol matches when present
-		if r.Symbol != "" {
-			choose = func(rr any) bool { return strings.EqualFold(r.Symbol, symUpper) }
-		}
-		if r.SecType == "STK" && choose(r) {
-			return r.Conid, nil
-		}
-		for _, s := range r.Sections {
-			if s.SecType == "STK" && (s.Symbol == "" || strings.EqualFold(s.Symbol, symUpper)) {
-				return r.Conid, nil
-			}
-		}
+	if len(results) == 0 {
+		return 0, fmt.Errorf("no contract found for %s", symbol)
 	}
-	return 0, fmt.Errorf("no STK contract found for %s", symbol)
+	// If you must enforce STK only, call /v1/api/iserver/contract/{conid}/info and
+	// check instrument_type == "STK". We keep it simple here.
+	return results[0].Conid, nil
 }
 
 func (c *Client) HTTPClient() *http.Client { return c.httpc }
@@ -472,7 +474,23 @@ func (c *Client) InjectCookies(cookies []*http.Cookie) {
 	c.saveSession()
 }
 
-// LastSessionID returns the last session id captured from /tickle, used to authorize the websocket.
-func (c *Client) LastSessionID() string {
-	return c.lastSessionID
+// RefreshSessionID calls POST /v1/api/tickle and stores the websocket session id if present.
+func (c *Client) RefreshSessionID(ctx context.Context) (string, error) {
+	resp, err := c.do(ctx, http.MethodPost, "/v1/api/tickle", nil)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	var m map[string]any
+	if len(b) > 0 && json.Unmarshal(b, &m) == nil {
+		if s, _ := m["session"].(string); s != "" {
+			c.lastSessionID = s
+			return s, nil
+		}
+	}
+	return "", nil
 }
+
+// SessionID returns the last known websocket session id (after refreshSessionID).
+func (c *Client) SessionID() string { return c.lastSessionID }

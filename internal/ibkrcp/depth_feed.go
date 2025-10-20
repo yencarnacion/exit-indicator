@@ -235,7 +235,20 @@ func (f *IBKRCPGatewayDepthFeed) openWS() (*websocket.Conn, error) {
         },
 	}
 	ws, _, err := d.DialContext(f.ctx, u.String(), nil)
-	return ws, err
+	if err != nil {
+		return nil, err
+	}
+
+	// Immediately send session ID to authenticate the WebSocket connection.
+	sid, _ := f.client.RefreshSessionID(f.ctx) // try refresh first
+	if sid == "" {
+		sid = f.client.SessionID() // fall back to cached value
+	}
+	if sid != "" {
+		_ = ws.WriteMessage(websocket.TextMessage, []byte(`{"session":"`+sid+`"}`))
+	}
+
+	return ws, nil
 }
 
 // subscribeDepth sends a minimal subscription command. IBKR may change these specifics;
