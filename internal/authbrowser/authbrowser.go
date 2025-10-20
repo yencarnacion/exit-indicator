@@ -131,19 +131,7 @@ func AcquireSessionCookie(ctx context.Context, httpJar *cookiejar.Jar, opts Opti
 		return fmt.Errorf("navigate login: %w", err)
 	}
 
-    // 2) Wait for the interactive SSO to complete.
-    // We poll location until we leave the login page/dispatcher; then we run validate→reauth→status.
-    var loc string
-    for i := 0; i < 200; i++ { // ~200 * 2s = ~400s inside the overall 'wait'
-        _ = chromedp.Run(cctx, chromedp.Evaluate(`window.location.pathname || ""`, &loc))
-        // once user finished 2FA, the page is no longer the /sso/Login route; often via /sso/Dispatcher then UI
-        if !strings.Contains(loc, "/sso/Login") {
-            break
-        }
-        time.Sleep(2 * time.Second)
-    }
-
-    // 3) Now perform validate→reauth→status in page context (uses browser cookies).
+    // 2) Perform validate→reauth→status in page context (uses browser cookies).
     jsFlow := fmt.Sprintf(`
 (async () => {
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
