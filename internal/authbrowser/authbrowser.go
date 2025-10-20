@@ -89,7 +89,9 @@ func AcquireSessionCookie(ctx context.Context, httpJar *cookiejar.Jar, opts Opti
 
 	loginURL := fmt.Sprintf("%s/sso/Login?forwardTo=22&RL=%d&ip2loc=on", opts.BaseURL, opts.RL)
 	validateURL := opts.BaseURL + "/v1/portal/sso/validate"
-	reauthURL := opts.BaseURL + "/v1/portal/iserver/reauthenticate?force=true"
+    // Prefer the /v1/api route, but fall back to /v1/portal if needed
+    reauthURLPrimary  := opts.BaseURL + "/v1/api/iserver/reauthenticate?force=true"
+    reauthURLFallback := opts.BaseURL + "/v1/portal/iserver/reauthenticate?force=true"
 	statusURL := opts.BaseURL + "/v1/api/iserver/auth/status"
 
 	// Enable network domain to fetch HttpOnly cookies
@@ -120,10 +122,20 @@ func AcquireSessionCookie(ctx context.Context, httpJar *cookiejar.Jar, opts Opti
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   try {
     for (let k=0;k<3;k++) { // a couple of tries
-      await fetch('%s', { credentials: 'include' });
-      await fetch('%s', { method: 'POST', credentials: 'include' });
+      await fetch('%s', { credentials: 'include' });           // validate
+      let ok = false;
+      try {
+        const r1 = await fetch('%s', { method: 'POST', credentials: 'include' });
+        ok = r1 && (r1.ok || r1.status === 204);
+      } catch (_) {}
+      if (!ok) {
+        try {
+          const r2 = await fetch('%s', { method: 'POST', credentials: 'include' });
+          ok = r2 && (r2.ok || r2.status === 204);
+        } catch (_) {}
+      }
       for (let i=0;i<20;i++) { // up to ~30s (20 * 1500ms)
-        const r = await fetch('%s', { credentials: 'include' });
+        const r = await fetch('%s', { credentials: 'include' }); // status
         if (r.ok) {
           const t = await r.text();
           try {
@@ -139,7 +151,7 @@ func AcquireSessionCookie(ctx context.Context, httpJar *cookiejar.Jar, opts Opti
     return '';
   }
 })()
-`, jsEscape(validateURL), jsEscape(reauthURL), jsEscape(statusURL))
+`, jsEscape(validateURL), jsEscape(reauthURLPrimary), jsEscape(reauthURLFallback), jsEscape(statusURL))
 
     var finalJSON string
     // 4) Run the flow once; if it doesn't flip yet, we keep nudging it a few more times.

@@ -132,10 +132,16 @@ func (c *Client) ensureBrokerageSession(ctx context.Context) error {
         if err == nil {
             _ = resp.Body.Close()
         }
-        // 2) reauthenticate brokerage (POST)
-        resp, err = c.do(ctx, http.MethodPost, "/v1/portal/iserver/reauthenticate?force=true", h)
-        if err == nil {
-            _ = resp.Body.Close()
+        // 2) reauthenticate brokerage (POST) – prefer /v1/api, fall back to /v1/portal
+        for _, p := range []string{
+            "/v1/api/iserver/reauthenticate?force=true",
+            "/v1/portal/iserver/reauthenticate?force=true",
+        } {
+            resp, err = c.do(ctx, http.MethodPost, p, h)
+            if err == nil {
+                _ = resp.Body.Close()
+                break
+            }
         }
 
         // 3) status (GET)
@@ -194,7 +200,8 @@ func (c *Client) Connect(ctx context.Context) error {
             BaseURL:  c.baseURL,   // e.g. https://localhost:5001
             RL:       rl,
             Headless: false,       // show the window so you can do 2FA
-            Wait:     5 * time.Minute,
+            // Wait=0 => authbrowser uses EXIT_INDICATOR_LOGIN_WAIT_SECONDS (or its default)
+            Wait:     0,
         }
         // Launch visible Chrome; complete 2FA, helper will inject cookies
         if err2 := authbrowser.AcquireSessionCookie(ctx, c.jar, abOpts); err2 != nil {
