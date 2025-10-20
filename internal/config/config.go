@@ -33,7 +33,7 @@ func defaults() Config {
 		LevelsToScan:           10,
 		PriceReference:         "best_ask",
 		LogLevel:               "info",
-		IBKRGatewayURL:         "https://127.0.0.1:5000",
+		IBKRGatewayURL:         "https://localhost:5001",
 		SessionStorePath:       "./data/session.json",
 	}
 }
